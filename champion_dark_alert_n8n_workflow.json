@@ -1,0 +1,232 @@
+{
+  "name": "Champion Dark Alert — Daily GTM Automation",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 8 * * 1-5"
+            }
+          ]
+        }
+      },
+      "id": "node-1",
+      "name": "Daily Schedule (8am Weekdays)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.1,
+      "position": [240, 300],
+      "notes": "Runs every weekday at 8am. CSMs see alerts at the start of their day."
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "={{$env.CRM_API_BASE_URL}}/accounts",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "Bearer {{$env.CRM_API_KEY}}"
+            }
+          ]
+        },
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "renewal_within_days",
+              "value": "90"
+            },
+            {
+              "name": "include_contacts",
+              "value": "true"
+            },
+            {
+              "name": "include_notes",
+              "value": "true"
+            }
+          ]
+        }
+      },
+      "id": "node-2",
+      "name": "Fetch Accounts from CRM",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [480, 300],
+      "notes": "In production: HubSpot/Salesforce API. For demo: swap with Read Binary File node pointing at the xlsx export."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ── TRIGGER EVALUATION ENGINE ─────────────────────────────────\n// Runs the compound trigger logic:\n//   Gate 1: renewal <= 90 days (or overdue)\n//   Gate 2: at least one champion with Never or Quarterly login\n//   Gate 3: last CSM note is >21 days stale\n\nconst RENEWAL_WINDOW = 90;\nconst STALE_NOTE_DAYS = 21;\nconst DARK_LOGIN = ['Never', 'Quarterly'];\nconst TODAY = new Date('2026-02-26');\n\nconst accounts = $input.all()[0].json.accounts || [];\nconst contacts = $input.all()[0].json.contacts || [];\nconst notes    = $input.all()[0].json.notes || [];\n\n// Build lookup maps\nconst contactsByAccount = {};\ncontacts.forEach(c => {\n  if (!contactsByAccount[c.account_id]) contactsByAccount[c.account_id] = [];\n  contactsByAccount[c.account_id].push(c);\n});\n\nconst latestNoteByAccount = {};\nnotes.forEach(n => {\n  const d = new Date(n.note_date);\n  if (!latestNoteByAccount[n.account_id] || d > new Date(latestNoteByAccount[n.account_id].note_date)) {\n    latestNoteByAccount[n.account_id] = n;\n  }\n});\n\nconst triggered = [];\n\naccounts.forEach(acct => {\n  const renewal = new Date(acct.renewal_date);\n  const daysToRenewal = Math.round((renewal - TODAY) / (1000 * 60 * 60 * 24));\n\n  // Gate 1: renewal window\n  if (daysToRenewal > RENEWAL_WINDOW) return;\n\n  // Gate 2: dark champion\n  const acctContacts = contactsByAccount[acct.account_id] || [];\n  const champions = acctContacts.filter(c => c.role_type === 'Champion');\n  if (champions.length === 0) return;\n  const darkChampions = champions.filter(c => DARK_LOGIN.includes(c.login_frequency));\n  if (darkChampions.length === 0) return;\n\n  // Gate 3: stale notes\n  const latestNote = latestNoteByAccount[acct.account_id];\n  let daysSinceNote = 999;\n  let lastNoteText = 'No notes on record';\n  if (latestNote) {\n    daysSinceNote = Math.round((TODAY - new Date(latestNote.note_date)) / (1000 * 60 * 60 * 24));\n    lastNoteText = latestNote.note;\n  }\n  if (daysSinceNote < STALE_NOTE_DAYS) return;\n\n  // Calculate usage trend\n  const usageCols = ['usage_m1_sep','usage_m2_oct','usage_m3_nov','usage_m4_dec','usage_m5_jan','usage_m6_feb_current'];\n  const usageVals = usageCols.map(c => acct[c]).filter(v => v != null);\n  let usageTrend = 'unknown';\n  if (usageVals.length >= 2) {\n    const first = usageVals.slice(0, 3).reduce((a,b) => a+b, 0) / 3;\n    const last  = usageVals.slice(-3).reduce((a,b) => a+b, 0) / 3;\n    usageTrend = last > first * 1.1 ? 'increasing' : (last < first * 0.9 ? 'declining' : 'flat');\n  }\n\n  triggered.push({\n    account_id:       acct.account_id,\n    company_name:     acct.company_name,\n    csm_assigned:     acct.csm_assigned,\n    mrr:              acct.mrr,\n    arr:              acct.arr,\n    plan_tier:        acct.plan_tier,\n    days_to_renewal:  daysToRenewal,\n    renewal_date:     acct.renewal_date,\n    nps_score:        acct.nps_score || 'N/A',\n    contraction_flag: acct.contraction_flag || false,\n    competitor:       acct.competitor_detected || null,\n    all_champions:    champions.map(c => c.name).join(', '),\n    dark_champions:   darkChampions.map(c => c.name).join(', '),\n    dark_champ_count: darkChampions.length,\n    total_champ_count:champions.length,\n    days_since_note:  daysSinceNote,\n    last_note_text:   lastNoteText,\n    usage_trend:      usageTrend,\n  });\n});\n\nif (triggered.length === 0) {\n  return [{ json: { status: 'no_triggers', count: 0, date: TODAY.toISOString().split('T')[0] }}];\n}\n\nreturn triggered.map(t => ({ json: t }));"
+      },
+      "id": "node-3",
+      "name": "Evaluate Compound Trigger",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, 300],
+      "notes": "Three-gate filter. All three must pass to generate an alert. Tune thresholds in env vars."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict"
+          },
+          "conditions": [
+            {
+              "id": "cond-1",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "no_triggers",
+              "operator": {
+                "type": "string",
+                "operation": "notEquals"
+              }
+            }
+          ],
+          "combinator": "and"
+        }
+      },
+      "id": "node-4",
+      "name": "Any Accounts Triggered?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [960, 300],
+      "notes": "True branch: accounts to alert. False branch: log 'no triggers today' and stop."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "x-api-key",
+              "value": "={{ $env.ANTHROPIC_API_KEY }}"
+            },
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "json",
+        "body": {
+          "model": "claude-sonnet-4-20250514",
+          "max_tokens": 400,
+          "messages": [
+            {
+              "role": "user",
+              "content": "=You are a GTM intelligence system. Generate a Slack alert for a Customer Success Manager.\n\nAccount context:\n- Company: {{ $json.company_name }} ({{ $json.plan_tier }} plan)\n- MRR: ${{ $json.mrr }} | ARR: ${{ $json.arr }}\n- Renewal: {{ $json.days_to_renewal }} days away ({{ $json.renewal_date }})\n- Champion(s): {{ $json.all_champions }}\n- Dark champion(s): {{ $json.dark_champions }}\n- Days since last CSM note: {{ $json.days_since_note }}\n- Last CSM note: \"{{ $json.last_note_text }}\"\n- NPS: {{ $json.nps_score }}\n- Contraction flag: {{ $json.contraction_flag }}\n- Competitor detected: {{ $json.competitor || 'None' }}\n- Usage trend: {{ $json.usage_trend }}\n\nWrite a Slack message for the assigned CSM. Format:\n🚨 *[Company Name]* — Champion Dark Alert\nThen 3-4 bullet points: what's happening, why it matters, what to do.\nUnder 150 words. Be direct. End with *Suggested next step:* bold line."
+            }
+          ]
+        }
+      },
+      "id": "node-5",
+      "name": "Generate Alert (Claude API)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1200, 200],
+      "notes": "Claude generates a context-specific, actionable alert for each account. Not a template — each alert is unique."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract Claude's response and build Slack Block Kit payload\nconst claudeResponse = $input.item.json;\nconst accountCtx = $('Evaluate Compound Trigger').item.json;\n\nconst alertText = claudeResponse.content[0].text;\n\n// Color code by urgency\nlet color = '#FFC107'; // yellow = <90d\nif (accountCtx.days_to_renewal < 0)  color = '#FF0000'; // red = overdue\nelse if (accountCtx.days_to_renewal < 30) color = '#FF6B35'; // orange = <30d\n\nconst slackPayload = {\n  text: `Champion Dark Alert: ${accountCtx.company_name}`,\n  attachments: [\n    {\n      color: color,\n      text: alertText,\n      footer: `GTM Intelligence • ${new Date().toISOString().split('T')[0]} • ${accountCtx.account_id}`,\n    }\n  ]\n};\n\nreturn {\n  json: {\n    slackPayload,\n    csm_assigned: accountCtx.csm_assigned,\n    account_id: accountCtx.account_id,\n    company_name: accountCtx.company_name,\n    mrr: accountCtx.mrr,\n    days_to_renewal: accountCtx.days_to_renewal,\n    alert_text: alertText\n  }\n};"
+      },
+      "id": "node-6",
+      "name": "Format Slack Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1440, 200],
+      "notes": "Wraps alert in Slack Block Kit. Red=overdue, orange=<30d, yellow=<90d. Routes to correct CSM channel."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={{ JSON.stringify($json.slackPayload) }}"
+      },
+      "id": "node-7",
+      "name": "Post to Slack",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1680, 200],
+      "notes": "Webhook URL stored in n8n credentials. Can be per-CSM channel or a shared #cs-alerts channel."
+    },
+    {
+      "parameters": {
+        "jsCode": "// Log alert to audit trail (Google Sheets or Postgres in production)\nconst data = $input.item.json;\nreturn {\n  json: {\n    timestamp: new Date().toISOString(),\n    account_id: data.account_id,\n    company_name: data.company_name,\n    csm_assigned: data.csm_assigned,\n    mrr: data.mrr,\n    days_to_renewal: data.days_to_renewal,\n    alert_sent: true,\n    alert_preview: data.alert_text.substring(0, 200)\n  }\n};"
+      },
+      "id": "node-8",
+      "name": "Log to Audit Trail",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1920, 200],
+      "notes": "In production: write to Google Sheets 'Alert Log' tab or INSERT into alerts table. Enables reporting on alert → outcome tracking."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.SLACK_WEBHOOK_URL_ENGINEERING }}",
+        "sendBody": true,
+        "contentType": "json",
+        "body": "={\"text\": \"⚠️ Champion Dark Alert workflow error: {{ $json.message }}. Check n8n execution log.\"}"
+      },
+      "id": "node-9",
+      "name": "Error → Slack Engineering",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [960, 500],
+      "notes": "Any node failure routes here. Posts to #gtm-engineering. Prevents silent failures."
+    }
+  ],
+  "connections": {
+    "Daily Schedule (8am Weekdays)": {
+      "main": [[{"node": "Fetch Accounts from CRM", "type": "main", "index": 0}]]
+    },
+    "Fetch Accounts from CRM": {
+      "main": [[{"node": "Evaluate Compound Trigger", "type": "main", "index": 0}]]
+    },
+    "Evaluate Compound Trigger": {
+      "main": [[{"node": "Any Accounts Triggered?", "type": "main", "index": 0}]]
+    },
+    "Any Accounts Triggered?": {
+      "main": [
+        [{"node": "Generate Alert (Claude API)", "type": "main", "index": 0}],
+        [{"node": "Error → Slack Engineering", "type": "main", "index": 0}]
+      ]
+    },
+    "Generate Alert (Claude API)": {
+      "main": [[{"node": "Format Slack Payload", "type": "main", "index": 0}]]
+    },
+    "Format Slack Payload": {
+      "main": [[{"node": "Post to Slack", "type": "main", "index": 0}]]
+    },
+    "Post to Slack": {
+      "main": [[{"node": "Log to Audit Trail", "type": "main", "index": 0}]]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "Champion Alert — Error Handler"
+  },
+  "meta": {
+    "description": "Detects champion disengagement + renewal proximity + stale CSM notes. Generates AI-written Slack alerts for assigned CSMs. Runs daily at 8am weekdays.",
+    "author": "Valentino",
+    "version": "1.0",
+    "tags": ["gtm", "cs-automation", "champion-risk", "renewal"]
+  }
+}
