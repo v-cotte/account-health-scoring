@@ -37,6 +37,7 @@ TODAY = pd.Timestamp('2026-02-26')
 
 # Credentials loaded automatically from .env file
 ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY', '')
+ANTHROPIC_MODEL   = os.getenv('ANTHROPIC_MODEL', 'claude-sonnet-4-20250514')
 SLACK_WEBHOOK_URL = os.getenv('SLACK_WEBHOOK_URL', '')
 
 # Trigger thresholds - tunable without code changes
@@ -198,7 +199,7 @@ End with a single bold *Suggested next step:* line."""
         'content-type': 'application/json'
     }
     payload = {
-        'model': 'claude-sonnet-4-20250514',
+        'model': ANTHROPIC_MODEL,
         'max_tokens': 400,
         'messages': [{'role': 'user', 'content': prompt}]
     }
@@ -302,9 +303,11 @@ def run_automation(dry_run=True):
         print("\n  ALERT PREVIEW:")
         print("  " + "\n  ".join(alert_text.split("\n")))
 
-        if not dry_run and SLACK_WEBHOOK_URL != 'YOUR_SLACK_WEBHOOK_HERE':
+        if not dry_run and SLACK_WEBHOOK_URL.startswith('https://hooks.slack.com/'):
             success = post_to_slack(alert_text, SLACK_WEBHOOK_URL, ctx)
             status = "Sent to Slack" if success else "Slack post failed"
+        elif not dry_run:
+            status = "Skipped — SLACK_WEBHOOK_URL not configured"
         else:
             status = "Dry run — not sent"
 
@@ -330,4 +333,11 @@ def run_automation(dry_run=True):
     return results
 
 if __name__ == '__main__':
-    results = run_automation(dry_run=False)
+    import argparse
+
+    parser = argparse.ArgumentParser(description='Detect dark champions and generate CSM alerts.')
+    parser.add_argument('--send', action='store_true',
+                        help='Post alerts to Slack (default: dry run, print only)')
+    args = parser.parse_args()
+
+    results = run_automation(dry_run=not args.send)
